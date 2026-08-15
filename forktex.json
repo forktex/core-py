@@ -1,0 +1,303 @@
+{
+  "manifestVersion": "1.0.0",
+  "name": "forktex-core",
+  "description": "Shared ForkTex Python substrate: 4-level catalog, database/cache/queue/vector/storage/store/vault/graph facades, Grid/Space/Flow pillars, and API/worker bootstraps",
+  "version": "0.1.0",
+  "fsd": {
+    "version": "1.1.0",
+    "profiles": [
+      "workspace/python-monorepo"
+    ],
+    "targetLevel": "L3",
+    "atoms": {
+      "test": {
+        "targets": [
+          "test"
+        ],
+        "description": "Automated tests verify behaviour at the unit and integration level, with a coverage floor",
+        "commands": [
+          "@# The floor ratchets: it is the measured figure, so coverage cannot silently drop.",
+          "@# Raise it when a pass adds real coverage; never lower it to make a change pass.",
+          "poetry run python3 -m pytest tests/ -q --cov=src/forktex_core --cov-report=term-missing:skip-covered --cov-fail-under=86"
+        ]
+      },
+      "typecheck": {
+        "targets": [
+          "typecheck"
+        ],
+        "description": "Static type system verifies interface correctness (pyright; install via dev deps)",
+        "commands": [
+          "poetry run python3 -m pyright src/"
+        ]
+      },
+      "audit": {
+        "targets": [
+          "audit"
+        ],
+        "description": "Scan the project venv for known CVEs in installed deps. Always uses `poetry run` so pip-audit reads the venv's installed packages, not the system Python (which would surface Ubuntu-shipped jinja2/cloud-init/ansible etc. — irrelevant to this library).",
+        "commands": [
+          "poetry run python3 -m pip_audit --skip-editable"
+        ]
+      },
+      "build": {
+        "targets": [
+          "build"
+        ],
+        "description": "Build sdist + wheel into dist/ and verify metadata with twine check",
+        "commands": [
+          "rm -rf dist/",
+          "poetry run python3 -m build",
+          "poetry run python3 -m twine check dist/*"
+        ]
+      },
+      "publish-test": {
+        "targets": [
+          "publish-test"
+        ],
+        "description": "Upload dist/ to TestPyPI (https://test.pypi.org) for rehearsal",
+        "commands": [
+          "poetry run python3 -m twine upload --repository testpypi dist/*"
+        ]
+      },
+      "publish": {
+        "targets": [
+          "publish"
+        ],
+        "description": "Upload dist/ to production PyPI (irreversible per-version)",
+        "commands": [
+          "poetry run python3 -m twine upload dist/*"
+        ]
+      },
+      "license-check": {
+        "targets": [
+          "license-check"
+        ],
+        "description": "Verify every source file carries the current AGPL-3.0 + Commercial dual-license header (CI gate)",
+        "commands": [
+          "poetry run python3 scripts/license_headers.py check"
+        ]
+      },
+      "license-fix": {
+        "targets": [
+          "license-fix"
+        ],
+        "description": "Add or update the dual-license header on every source file (idempotent)",
+        "commands": [
+          "poetry run python3 scripts/license_headers.py fix"
+        ]
+      },
+      "license-strip": {
+        "targets": [
+          "license-strip"
+        ],
+        "description": "Remove the dual-license header from every source file (use before license model changes)",
+        "commands": [
+          "poetry run python3 scripts/license_headers.py strip"
+        ]
+      },
+      "codegen": {
+        "targets": [
+          "codegen"
+        ],
+        "description": "Not applicable: forktex-core has no schema-derived artifacts",
+        "commands": [
+          "@echo 'codegen: not applicable for forktex-core (pure runtime library, no generated code)'"
+        ]
+      },
+      "codegen-check": {
+        "targets": [
+          "codegen-check"
+        ],
+        "description": "Not applicable: forktex-core has no generated artifacts to verify",
+        "commands": [
+          "@echo 'codegen-check: not applicable for forktex-core'"
+        ]
+      },
+      "ci": {
+        "targets": [
+          "ci"
+        ],
+        "description": "Aggregate quality gate before publish: format-check + lint + license-check + typecheck + audit + test + catalog-check + build + smoke",
+        "commands": [
+          "@$(MAKE) format-check",
+          "@$(MAKE) lint",
+          "@$(MAKE) license-check",
+          "@$(MAKE) typecheck",
+          "@$(MAKE) audit",
+          "@$(MAKE) test",
+          "@$(MAKE) catalog-check",
+          "@$(MAKE) build",
+          "@$(MAKE) smoke",
+          "@echo ''",
+          "@echo 'CI passed for $(PROJECT_NAME) — safe to: make publish-test  /  make publish'"
+        ]
+      },
+      "lint": {
+        "commands": [
+          "poetry run python3 -m ruff check src/ tests/"
+        ],
+        "targets": [
+          "lint"
+        ],
+        "description": "Static analysis catches bugs, anti-patterns, and security issues"
+      },
+      "format-check": {
+        "commands": [
+          "poetry run python3 -m ruff format --check src/ tests/"
+        ],
+        "targets": [
+          "format-check"
+        ],
+        "description": "Check formatting without rewriting files"
+      },
+      "format": {
+        "commands": [
+          "poetry run python3 -m ruff format src/ tests/"
+        ],
+        "targets": [
+          "format"
+        ],
+        "description": "Source code conforms to a consistent, auto-enforced style"
+      },
+      "test-perf": {
+        "targets": [
+          "test-perf"
+        ],
+        "description": "Run the grid limits/performance suite (opt-in; writes a JSONL artifact under tests/test_grid/test_limits/.runs/). Not gated by `make ci`.",
+        "commands": [
+          "poetry run python3 -m pytest tests/test_grid/test_limits/ -m perf -q -s"
+        ]
+      },
+      "test-perf-headroom": {
+        "targets": [
+          "test-perf-headroom"
+        ],
+        "description": "Probe the 1M-row tier on operations that survived the main ladder. Slow (minutes); requires FORKTEX_PERF_HEADROOM=1.",
+        "commands": [
+          "FORKTEX_PERF_HEADROOM=1 poetry run python3 -m pytest tests/test_grid/test_limits/test_headroom.py -m perf -q -s"
+        ]
+      },
+      "test-perf-report": {
+        "targets": [
+          "test-perf-report"
+        ],
+        "description": "Render the latest grid perf JSONL artifact as a markdown table (grid_ms / native_ms (Nx)).",
+        "commands": [
+          "poetry run python3 scripts/grid_perf_report.py"
+        ]
+      },
+      "catalog-check": {
+        "targets": [
+          "catalog-check"
+        ],
+        "description": "README's generated blocks match catalog.json (the machine SSOT)",
+        "commands": [
+          "poetry run python3 scripts/regenerate_readme.py --check"
+        ]
+      },
+      "smoke": {
+        "targets": [
+          "smoke"
+        ],
+        "description": "Install the BUILT wheel into a throwaway venv and import every extra",
+        "commands": [
+          "@# The gate `make ci` was missing: everything above tests the source tree, so a",
+          "@# packaging fault is invisible to it. `[worker]` shipped documented but",
+          "@# undeclared exactly this way.",
+          "@# Importing the module is NOT sufficient to prove an extra exists — most",
+          "@# modules here import fine without their dependency (it is looked up lazily so",
+          "@# the error can name the extra). pip merely *warns* on an unknown extra and",
+          "@# exits 0, so that warning is what this greps for.",
+          "@set -e; \\",
+          "wheel=$$(ls dist/*.whl | head -1); \\",
+          "py=$$(poetry run python3 -c 'import sys; print(sys.executable)'); \\",
+          "tmp=$$(mktemp -d); \\",
+          "trap 'rm -rf $$tmp' EXIT; \\",
+          "echo \"smoke: base install from $$wheel (interpreter $$py)\"; \\",
+          "$$py -m venv $$tmp/base >/dev/null; \\",
+          "$$tmp/base/bin/pip install -q \"$$wheel\"; \\",
+          "$$tmp/base/bin/python -c \"import forktex_core.log, forktex_core.error, forktex_core.types, forktex_core.iso, forktex_core.database, forktex_core.grid, forktex_core.space, forktex_core.flow, forktex_core.graph, forktex_core.catalog; print('  base modules import')\"; \\",
+          "for x in worker api vault storage queue vector store; do \\",
+          "  rm -rf $$tmp/x; $$py -m venv $$tmp/x >/dev/null; \\",
+          "  $$tmp/x/bin/pip install \"$$wheel[$$x]\" >$$tmp/log 2>&1 || { cat $$tmp/log; exit 1; }; \\",
+          "  if grep -q \"does not provide the extra\" $$tmp/log; then \\",
+          "    echo \"  [$$x] FAIL — pyproject declares no '$$x' extra (pip only warns)\"; exit 1; \\",
+          "  fi; \\",
+          "  $$tmp/x/bin/python -c \"import importlib; importlib.import_module('forktex_core.'+'$$x')\"; \\",
+          "  echo \"  [$$x] OK\"; \\",
+          "done; \\",
+          "echo \"smoke: every extra resolves and delivers a working module\""
+        ]
+      },
+      "typing": {
+        "targets": [
+          "typing"
+        ],
+        "description": "Static type system verifies interface correctness across the codebase",
+        "commands": [
+          "@# `poetry run`, not bare `python` — pyright resolves imports from the",
+          "@# interpreter's environment, and `poetry run` is what exports `VIRTUAL_ENV`",
+          "@# for it. Run bare and you get ~210 phantom `reportMissingImports` errors",
+          "@# that look like real type errors. `typecheck` is the same command.",
+          "poetry run python3 -m pyright src/"
+        ]
+      },
+      "license": {
+        "targets": [
+          "license"
+        ],
+        "description": "Source headers and dependency licenses verified against policy",
+        "commands": [
+          "poetry run python3 scripts/license_headers.py check"
+        ]
+      },
+      "test-cov": {
+        "targets": [
+          "test-cov"
+        ],
+        "description": "Run the suite with coverage reporting",
+        "commands": [
+          "poetry run python3 -m pytest tests/ --cov=src --cov-report=term-missing"
+        ]
+      },
+      "security": {
+        "targets": [
+          "security"
+        ],
+        "description": "Dependencies and code scanned for known vulnerabilities and security smells",
+        "commands": [
+          "poetry run python3 -m pip_audit --skip-editable"
+        ]
+      },
+      "lint-fix": {
+        "targets": [
+          "lint-fix"
+        ],
+        "description": "Lint and auto-fix where possible",
+        "commands": [
+          "poetry run python3 -m ruff check --fix src/ tests/"
+        ]
+      }
+    }
+  },
+  "packages": [
+    {
+      "name": "forktex-core",
+      "path": ".",
+      "version": "2.4.0",
+      "publishable": true,
+      "language": "python",
+      "registry": "https://pypi.org",
+      "description": "Shared ForkTex substrate library: database/cache/queue/vector/storage/vault/graph facades plus Grid/Space/Flow"
+    }
+  ],
+  "knowledge": {
+    "pinnedTag": "pinned",
+    "groundingCharBudget": 4000,
+    "knowledgeLimit": 40,
+    "retiredStatuses": [
+      "retired",
+      "rolled-up"
+    ]
+  }
+}

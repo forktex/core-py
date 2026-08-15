@@ -1,0 +1,182 @@
+# Copyright (C) 2026 FORKTEX S.R.L.
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later OR LicenseRef-ForkTex-Commercial
+#
+# This file is part of forktex-core.
+#
+# For commercial licensing -- including use in proprietary products, SaaS
+# deployments, or any context where AGPL obligations cannot be met -- you
+# MUST obtain a commercial license from FORKTEX S.R.L. (info@forktex.com).
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "forktex-core"
+version = "0.1.0"
+description = "Shared Python substrate for ForkTex services — async Postgres, Redis, durable execution, encryption, S3/MinIO, background jobs, vector search, MongoDB document store, tenant-defined Grid schemas, and structured logging"
+keywords = [
+    "forktex",
+    "postgres", "asyncpg", "sqlalchemy",
+    "redis", "cache",
+    "flow", "durable-execution", "workflow", "pipeline", "state-machine",
+    "vault", "encryption", "fernet",
+    "storage", "s3", "minio",
+    "queue", "arq", "background-jobs",
+    "vector", "qdrant", "semantic-search",
+    "store", "mongo", "document-store",
+    "logging", "loki",
+]
+readme = "README.md"
+license = "AGPL-3.0-or-later OR LicenseRef-ForkTex-Commercial"
+license-files = ["LICENSE", "NOTICE"]
+authors = [{name = "FORKTEX", email = "info@forktex.com"}]
+requires-python = ">=3.14,<4.0"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Logging",
+    "Typing :: Typed",
+]
+dependencies = [
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "redis[hiredis]>=5.0",
+    "pydantic>=2.0",
+    # croniter: used by flow.driver at runtime — not just dev
+    "croniter>=2.0",
+]
+
+[project.optional-dependencies]
+# Every extra named in `catalog/catalog.json` is a valid install target, so the
+# `[x]` syntax the docs use always resolves. Several are intentionally empty:
+# their module runs on the core dependencies, and the extra exists so
+# `forktex-core[grid]` documents intent rather than failing as an unknown extra
+# (pip only *warns* on those, which is how `[worker]` shipped documented but
+# undeclared — a consumer got `forktex_core.worker` with no arq behind it).
+log     = []                           # level 0 — always bundled
+error   = []                           # level 0 — always bundled
+types   = []                           # level 0 — always bundled
+iso     = []                           # level 0 — always bundled
+cache   = []                           # redis is a core dep — extra exists for [cache] syntax
+database = []                          # sqlalchemy/asyncpg are core deps
+grid    = []                           # forktex_core.grid — runs on the core sqlalchemy/asyncpg deps
+graph   = []                           # forktex_core.graph — pure in-memory algebra, no extra deps
+space   = []                           # forktex_core.space — composes [grid]/[graph]; [vector]/[storage] lazy
+flow    = []                           # forktex_core.flow — core sqlalchemy/asyncpg + croniter (a core dep)
+vault   = ["cryptography>=42.0"]
+storage = ["aioboto3>=13.0"]
+queue   = ["arq>=0.26"]
+vector  = ["qdrant-client>=1.9"]
+store   = ["pymongo>=4.9"]
+api     = ["fastapi>=0.115"]           # forktex_core.api factory (multipart/forms are consumer-owned)
+worker  = ["arq>=0.26"]                # the consumer hosts — same arq dep as [queue], its mandatory base
+all = [
+    "cryptography>=42.0",
+    "aioboto3>=13.0",
+    "arq>=0.26",
+    "qdrant-client>=1.9",
+    "pymongo>=4.9",
+    "fastapi>=0.115",
+]
+
+[project.urls]
+"Homepage"    = "https://forktex.com"
+"Repository"  = "https://github.com/forktex/core-py"
+"Bug Tracker" = "https://github.com/forktex/core-py/issues"
+"Changelog"   = "https://github.com/forktex/core-py/releases"
+
+
+[tool.poetry]
+packages = [{ include = "forktex_core", from = "src" }]
+include = [
+    { path = "src/forktex_core/flow/persist/migrations/*.sql", format = ["sdist", "wheel"] },
+    { path = "src/forktex_core/grid/persist/migrations/*.sql", format = ["sdist", "wheel"] },
+    { path = "src/forktex_core/py.typed", format = ["sdist", "wheel"] },
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7.0",
+    "pyright>=1.1.350",
+    "pip-audit>=2.7.0",
+    "build>=1.2.0",
+    "twine>=5.0.0",
+    "testcontainers>=4.0",
+    "testcontainers[redis]>=4.0",
+    "testcontainers[mongodb]>=4.0",
+    "croniter>=2.0",
+    # Optional extras — installed for their respective test suites
+    "cryptography>=42.0",
+    "aioboto3>=13.0",
+    "arq>=0.26",
+    "qdrant-client>=1.9",
+    "pymongo>=4.9",
+    "pytest-cov>=6.0",
+    "fastapi>=0.115",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+    "asgi-lifespan>=2.1",
+]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 120
+
+[tool.ruff.lint]
+# The target strict set (incl. flake8-annotations for proper typing), rolled out
+# package by package during the v0.1.0 cleanup — see docs/ARCHITECTURE.md and the
+# python-lint standard. **Every package under src/ now passes it**, so the
+# per-package relaxation that used to live below is gone; there is one standard.
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "ANN"]
+
+[tool.ruff.lint.per-file-ignores]
+# `src/` carries NO exemptions — every module passes the full strict set,
+# `ANN401` included. Keep it that way: a new `Any` in a signature is a prompt to
+# name the type (`JsonValue` for a JSON boundary, `object` for a value only
+# passed through, the real class under `TYPE_CHECKING` for an import cycle),
+# not to add a line here.
+# Tests: baseline only (test code isn't held to the annotation/strict set).
+"tests/**" = ["E1", "E2", "E5", "I", "UP", "B", "SIM", "RUF", "ANN"]
+
+[tool.pyright]
+include = ["src"]
+pythonVersion = "3.14"
+typeCheckingMode = "basic"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+log_cli = false
+log_level = "WARNING"
+markers = [
+    "perf: opt-in performance/limits tests; excluded from `make test` and `make ci`",
+]
+addopts = "-m 'not perf'"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]

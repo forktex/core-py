@@ -1,0 +1,25 @@
+.idea/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+.forktex/
+tests/test_grid/test_limits/.runs/
+
+# forktex — generated + secrets (keep .forktex/.version committed)
+.forktex/**
+!.forktex/.version
+
+# forktex — only .forktex/knowledge and .version are committed
+.forktex/**
+!.forktex/.version
+!.forktex/knowledge/
+!.forktex/knowledge/**

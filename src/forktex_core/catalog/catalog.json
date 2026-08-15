@@ -1,0 +1,266 @@
+{
+  "levels": [
+    {
+      "level": 0,
+      "name": "primitives",
+      "description": "Zero-dep cross-cutting utilities. Always pulled.",
+      "extras": ["log", "error", "types", "iso"]
+    },
+    {
+      "level": 1,
+      "name": "role_facades",
+      "description": "Role-named facades over one infra service each. Expose Database() / Cache() / Queue() / Vector() / Storage() / Store() / Vault() / Graph() user-facing classes.",
+      "extras": ["database", "cache", "queue", "vector", "storage", "store", "vault", "graph"]
+    },
+    {
+      "level": 2,
+      "name": "substrate_facades",
+      "description": "Substrate user-facing pillars composing level 0–1.",
+      "extras": ["grid", "space", "flow"]
+    },
+    {
+      "level": 3,
+      "name": "bootstraps",
+      "description": "Process-level runtime wiring (FastAPI factory, queue-consumer hosts).",
+      "extras": ["api", "worker"]
+    }
+  ],
+  "extras": [
+    {
+      "id": "log",
+      "level": 0,
+      "kind": "primitive",
+      "label": "Logging",
+      "role": "Structured logging protocol + request-id context propagation.",
+      "depends_on": ["iso"],
+      "status": "shipped"
+    },
+    {
+      "id": "iso",
+      "level": 0,
+      "kind": "primitive",
+      "label": "ISO Dates",
+      "role": "Canonical ISO-8601 date/time formatting and parsing — always UTC.",
+      "depends_on": [],
+      "status": "shipped"
+    },
+    {
+      "id": "error",
+      "level": 0,
+      "kind": "primitive",
+      "label": "Errors",
+      "role": "AppError hierarchy + envelope shape + http exception mapper.",
+      "depends_on": [],
+      "status": "shipped",
+      "phase": 1
+    },
+    {
+      "id": "types",
+      "level": 0,
+      "kind": "primitive",
+      "label": "Base Types",
+      "role": "Base Pydantic models, frozen value objects, JSON-Schema conventions.",
+      "depends_on": [],
+      "status": "shipped",
+      "phase": 1
+    },
+
+    {
+      "id": "database",
+      "level": 1,
+      "kind": "facade",
+      "label": "Database",
+      "role": "Relational/ACID structured-state (Postgres/SQLAlchemy): Database handle, BaseDBModel + substrate_base, AuditMixin, and the DDL/reflect/filters/pagination/locks/identifiers/integrity primitives every higher package builds on.",
+      "tech": {"today": "postgres", "infra_required": "postgres"},
+      "depends_on": ["log", "error", "types", "iso"],
+      "status": "shipped"
+    },
+    {
+      "id": "cache",
+      "level": 1,
+      "kind": "facade",
+      "label": "Cache",
+      "role": "Key-value cache (Redis): get/set, decorators, prefix invalidation.",
+      "tech": {"today": "redis", "infra_required": "redis"},
+      "depends_on": ["log", "error", "types"],
+      "status": "shipped"
+    },
+    {
+      "id": "queue",
+      "level": 1,
+      "kind": "facade",
+      "label": "Queue",
+      "role": "Async job queue (Redis/arq): tasks, enqueue, JobCtx.",
+      "tech": {"today": "redis", "infra_required": "redis"},
+      "depends_on": ["log", "error", "types"],
+      "status": "shipped"
+    },
+    {
+      "id": "vector",
+      "level": 1,
+      "kind": "facade",
+      "label": "Vector",
+      "role": "Vector store + similarity search (Qdrant): CollectionHandle, VectorPoint, search.",
+      "tech": {"today": "qdrant", "infra_required": "qdrant"},
+      "depends_on": ["log", "error", "types"],
+      "status": "shipped"
+    },
+    {
+      "id": "storage",
+      "level": 1,
+      "kind": "facade",
+      "label": "Storage",
+      "role": "Object/blob storage (S3/MinIO): presigned URLs, presigned POST.",
+      "tech": {"today": "minio", "infra_required": "minio"},
+      "depends_on": ["log", "error", "types"],
+      "status": "shipped"
+    },
+    {
+      "id": "store",
+      "level": 1,
+      "kind": "facade",
+      "label": "Object Store",
+      "role": "Schemaless document records (BSON/JSON shape, eventual consistency), MongoDB-backed. Distinct from [storage], which holds opaque binary blobs.",
+      "tech": {"today": "mongo", "infra_required": "mongo"},
+      "depends_on": ["log", "error", "types"],
+      "status": "shipped"
+    },
+    {
+      "id": "vault",
+      "level": 1,
+      "kind": "facade",
+      "label": "Vault",
+      "role": "Crypto-at-rest helpers (Fernet over [database] state).",
+      "depends_on": ["log", "error", "types", "database"],
+      "status": "shipped"
+    },
+    {
+      "id": "graph",
+      "level": 1,
+      "kind": "facade",
+      "label": "Graph",
+      "role": "In-memory multi-edge typed-graph algebra. Graph() with BFS/DFS/closure/cycle, deterministic edge IDs, JSON export. No infra dep.",
+      "depends_on": ["log", "error", "types"],
+      "status": "shipped",
+      "phase": 3
+    },
+
+    {
+      "id": "grid",
+      "level": 2,
+      "kind": "facade",
+      "label": "Grid",
+      "role": "Tabular state pillar — typed cells, rows, cell-pinned edges, recursive-CTE traversal, JSON-Schema import/export. Pure-tabular: no VECTOR/FILE handlers.",
+      "depends_on": ["log", "error", "types", "iso", "database"],
+      "status": "shipped",
+      "phase": 2
+    },
+    {
+      "id": "space",
+      "level": 2,
+      "kind": "facade",
+      "label": "Space",
+      "role": "Multi-grid bundle + rich-content wrapper (VECTOR/FILE field types) + cross-grid traversal + SyncSourceConfig contract.",
+      "depends_on": ["log", "error", "types", "grid", "graph"],
+      "lazy_imports": ["vector", "storage"],
+      "status": "shipped",
+      "phase": 4
+    },
+    {
+      "id": "flow",
+      "level": 2,
+      "kind": "facade",
+      "label": "Flow",
+      "role": "Durable workflow execution. Tasks, runs, step events, scheduled runs.",
+      "depends_on": ["log", "error", "types", "iso", "database", "queue", "cache"],
+      "status": "shipped"
+    },
+    {
+      "id": "api",
+      "level": 3,
+      "kind": "bootstrap",
+      "label": "API Server",
+      "role": "FastAPI factory: standard middleware stack, lifespan, typed health probes, error envelope with HTTP status mapping.",
+      "depends_on": ["log", "error", "types"],
+      "optional_for_consumer": ["grid", "space", "database", "cache", "vault"],
+      "status": "shipped",
+      "phase": 6
+    },
+    {
+      "id": "worker",
+      "level": 3,
+      "kind": "bootstrap",
+      "label": "Worker",
+      "role": "Queue-consumer hosts: Worker (async lifecycle + awaitable run) run standalone, embedded in a host loop, or one per OS process.",
+      "depends_on": ["log", "error", "types", "queue"],
+      "optional_for_consumer": ["database", "grid", "space", "flow"],
+      "status": "shipped",
+      "phase": 6
+    }
+  ],
+  "relations": [
+    {"kind": "depends_on", "src": "vault", "dst": "database"},
+    {"kind": "depends_on", "src": "grid", "dst": "database"},
+    {"kind": "depends_on", "src": "space", "dst": "grid"},
+    {"kind": "depends_on", "src": "space", "dst": "graph"},
+    {"kind": "lazy_imports", "src": "space", "dst": "vector", "note": "when a VECTOR field is declared on a Grid in this Space"},
+    {"kind": "lazy_imports", "src": "space", "dst": "storage", "note": "when a FILE field is declared on a Grid in this Space"},
+    {"kind": "depends_on", "src": "flow", "dst": "database"},
+    {"kind": "depends_on", "src": "flow", "dst": "queue"},
+    {"kind": "depends_on", "src": "flow", "dst": "cache"},
+    {"kind": "depends_on", "src": "worker", "dst": "queue"},
+    {"kind": "consumes", "src": "api", "dst": "grid", "note": "optional — consumer mounts grid's CRUD router"},
+    {"kind": "consumes", "src": "api", "dst": "space", "note": "optional — consumer mounts space's multipart routes for FILE"},
+    {"kind": "consumes", "src": "api", "dst": "database", "note": "optional — for commit/rollback middleware"},
+    {"kind": "consumes", "src": "api", "dst": "cache", "note": "optional — for rate-limit / idempotency middleware"},
+    {"kind": "consumes", "src": "worker", "dst": "flow", "note": "optional — consumer wires flow driver into worker process"},
+    {"kind": "consumes", "src": "worker", "dst": "grid", "note": "optional — for tasks that operate on grids"}
+  ],
+  "presentation": {
+    "level_colors": {
+      "0": "455A64",
+      "1": "1976D2",
+      "2": "7E57C2",
+      "3": "2E7D32"
+    },
+    "colors": {
+      "log": "455A64",
+      "error": "C62828",
+      "types": "5D4037",
+
+      "database": "336791",
+      "cache": "DC382D",
+      "queue": "EF6C00",
+      "vector": "DC4A3D",
+      "storage": "FF9900",
+      "store": "47A248",
+      "vault": "2E7D32",
+      "graph": "F57C00",
+
+      "grid": "1976D2",
+      "space": "7E57C2",
+      "flow": "00897B",
+
+      "api": "0277BD",
+      "worker": "5E35B1"
+    },
+    "role_icons": {
+      "log": "file-text",
+      "error": "alert-triangle",
+      "types": "code",
+      "database": "database",
+      "cache": "zap",
+      "queue": "list",
+      "vector": "compass",
+      "storage": "archive",
+      "store": "file-plus",
+      "vault": "lock",
+      "graph": "git-branch",
+      "grid": "grid",
+      "space": "layers",
+      "flow": "play-circle",
+      "api": "globe",
+      "worker": "cpu"
+    }
+  }
+}
