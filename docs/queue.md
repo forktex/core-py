@@ -1,264 +1,129 @@
-# `forktex_core.queue` — Background job queue
+# forktex_core.queue
 
-> arq-backed (Redis-native, asyncio-first) fire-and-forget queue. Use `flow` for durable execution with replay; use `queue` for at-least-once delivery where Redis suffices.
+arq-backed background job queue on Redis: `@task` to register, `enqueue`/`enqueue_at` to dispatch, `make_worker` to build the consumer, plus operator calls for inspection and cancellation. For durable execution with replay and state, use `flow` instead.
 
-## Overview
-
-`queue` wraps arq with a simpler API: `@task` decorator for registration, `enqueue`/`enqueue_at` for dispatch, `make_worker` for the worker process, and operator visibility via `inspect_job`/`cancel_job`/`worker_health`.
-
-`make_worker(..., handle_signals=True)` controls whether arq installs the
-SIGTERM/SIGINT drain. Leave it on for a standalone worker; a host that embeds the
-consumer (an API lifespan, a supervised child) must turn it off or arq's handlers
-fight the host's own shutdown. [`forktex_core.worker`](worker.md) does this for
-you and is the recommended entry point.
+## Install
 
 ```bash
-pip install forktex-core[queue]   # arq
+pip install "forktex-core[queue]"   # arq
 ```
 
-## Quick start
+The extra is required, but the failure is **lazy**: `import forktex_core.queue` succeeds without `arq`. The first call that actually needs it — `enqueue`, `enqueue_at`, `make_worker`, or any operator function that opens the pool — raises `ImportError("Install 'forktex-core[queue]' (arq) to use forktex_core.queue")`. So a service can ship the import and only discover the missing extra at first dispatch.
+
+## Wiring
+
+Shape A — a module-level singleton. `await init(redis_url)` records the URL and drops any cached pool; the `ArqRedis` pool itself is created lazily on first use and reused for the module's lifetime. `await close()` closes it and clears the URL; it is idempotent.
 
 ```python
-from forktex_core.queue import task, init, enqueue, enqueue_at, make_worker, JobCtx
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
-await init("redis://localhost:6379/1")
-
-
-@task
-async def send_email(ctx: JobCtx, to: str, subject: str) -> None:
-    await smtp.send(to, subject)
-
-
-@task(queue="critical", timeout=60, retries=2)
-async def notify_webhook(ctx: JobCtx, url: str, payload: dict) -> None:
-    await http.post(url, json=payload)
-
-
-# Enqueue immediately
-job_id = await enqueue(send_email, "user@example.com", "Welcome!")
-
-# Enqueue at a specific time
-job_id = await enqueue_at(
-    send_email,
-    "user@example.com",
-    "7-day reminder",
-    eta=datetime(2026, 5, 9, 9, 0, tzinfo=timezone.utc),
-)
-```
-
-## API reference
-
-```python
-# Registration
-def task(
-    _fn=None, *, queue="default", timeout=300, retries=0,
-) -> Callable    # @task or @task(...)
-    # timeout/retries are applied per-function by make_worker (arq
-    # max_tries = retries + 1). For the delay *between* retries, raise
-    # arq.Retry(defer=seconds) from the job body — arq has no per-function
-    # retry-delay setting.
-
-class JobCtx(TypedDict):
-    redis: Any; job_id: str; job_try: int; enqueue_time: datetime; score: float
-
-# Lifecycle
-async def init(redis_url: str) -> None
-async def close() -> None
-    # Closes the cached Redis connection pool, if any. Idempotent. Call in
-    # test teardown / app shutdown to avoid leaking a pool across event loops.
-
-# Dispatch
-async def enqueue(fn, *args, _queue_name=None, **kwargs) -> str     # returns job_id
-async def enqueue_at(fn, *args, eta: datetime, _queue_name=None, **kwargs) -> str
-
-# Operator visibility — queue_name must match the queue the job was
-# enqueued on (via enqueue(..., _queue_name=...) or @task(queue=...));
-# it defaults to "default" to match enqueue()'s own default.
-async def inspect_job(job_id: str, *, queue_name="default") -> dict | None
-    # → {"job_id","status","function","args","kwargs","enqueue_time","start_time","finish_time","result","error","tries"}
-    # status: "queued" | "in_progress" | "complete" | "not_found"
-async def cancel_job(job_id: str, *, queue_name="default") -> bool
-    # True only if a worker was actively running the job and confirmed the
-    # cancellation within 1s. A merely queued/deferred job (no worker has
-    # picked it up yet) resolves False — see Edge cases below.
-async def list_jobs(queue_name="default", *, status=None) -> list[dict]
-    # only sees queued/deferred jobs (arq's per-queue sorted set) — not
-    # in-progress or completed ones
-async def worker_health(redis_url=None, *, queue_name="default") -> dict[str, int]
-    # → {"pending": int, "in_flight": int, "failed": int}
-    # queue_name must match the queue the jobs were enqueued on. pending and
-    # in_flight are read straight from Redis; failed is the cumulative count
-    # arq publishes in its health-check key, so it is 0 until a worker has
-    # recorded health.
-
-# Worker factory
-def make_worker(redis_url, *, queue_name="default", max_jobs=10, job_timeout=300) -> arq.Worker
-```
-
-## Patterns
-
-### Pattern 1 — Worker entrypoint module
-
-```python
-# my_service/worker.py
-import forktex_core.queue as q
-from my_service import tasks  # side-effect: @task decorators register functions
-
-WorkerSettings = q.make_worker("redis://localhost:6379/1")
-
-# Run: arq my_service.worker.WorkerSettings
-# Or programmatically:
-if __name__ == "__main__":
-    import asyncio
-
-    worker = q.make_worker("redis://localhost:6379/1")
-    asyncio.run(worker.async_run())
-```
-
-### Pattern 2 — Replace asyncio.create_task with durable queue
-
-```python
-# BEFORE: asyncio.create_task (lost on restart)
-asyncio.create_task(_ingest_document(doc_id, ...))
-
-# AFTER: queue (survives restart, retries on failure)
-@task(retries=2, timeout=300)
-async def ingest_document(ctx: JobCtx, doc_id: str, ...) -> None:
-    await _do_ingest(doc_id, ...)
-
-job_id = await enqueue(ingest_document, str(doc.id), ...)
-```
-
-### Pattern 3 — Priority queues
-
-```python
-@task(queue="high-priority", timeout=30)
-async def urgent_notification(ctx: JobCtx, user_id: str) -> None: ...
-
-
-@task(queue="low-priority", timeout=600)
-async def bulk_export(ctx: JobCtx, org_id: str) -> None: ...
-
-
-# Separate workers per queue (or one worker per queue_name)
-high_worker = make_worker(redis_url, queue_name="high-priority", max_jobs=20)
-low_worker = make_worker(redis_url, queue_name="low-priority", max_jobs=2)
-```
-
-## Anti-patterns
-
-```python
-# ❌ Using queue for durable execution needing replay
-# → Use flow instead (guaranteed delivery, state, audit trail)
-
-# ❌ Unbounded list_jobs on high-throughput queue
-jobs = await list_jobs("default")  # may scan 10k+ keys
-
-# ✅ Filter by status
-pending = await list_jobs("default", status="queued")
-
-
-# ❌ Registering the same task name twice (silently overwrites)
-@task
-async def my_job(ctx): ...
-@task
-async def my_job(ctx): ...  # WARNING logged, second registration wins
-
-
-# ✅ Unique function names per registry
-```
-
----
-
-## Agent guide
-
-### Canonical forms
-
-**Service with queue integration:**
-```python
-# app/main.py
-from forktex_core.queue import init as queue_init
+from fastapi import FastAPI
+from forktex_core import queue
 
 
 @asynccontextmanager
-async def lifespan(app):
-    await queue_init(settings.redis_url)
-    yield  # queue.close() not needed — pool is per-enqueue
+async def lifespan(app: FastAPI):
+    await queue.init("redis://redis:6379/1")
+    yield
+    await queue.close()
 
 
-# tasks.py
-from forktex_core.queue import task, JobCtx
-
-
-@task(retries=2, timeout=120)
-async def process_document(ctx: JobCtx, doc_id: str) -> None:
-    async with get_session() as session:
-        await do_work(session, doc_id)
-
-
-# routes.py
-from forktex_core.queue import enqueue
-from .tasks import process_document
-
-
-@router.post("/items")
-async def upload(doc_id: str):
-    job_id = await enqueue(process_document, doc_id)
-    return {"job_id": job_id}
+app = FastAPI(lifespan=lifespan)
 ```
 
-**Inspect → cancel flow:**
+Call `close()` in teardown. Skipping it leaks a pool bound to a dead event loop, which is the usual cause of cross-test "attached to a different loop" failures.
+
+### Defining and dispatching tasks
+
 ```python
-info = await inspect_job(job_id)
-if info and info["status"] == "in_progress":
-    # cancel_job() only confirms True for a job a worker is actively running
-    cancelled = await cancel_job(job_id)
-    print("cancelled:", cancelled)
+from datetime import UTC, datetime
+
+from forktex_core.queue import JobCtx, enqueue, enqueue_at, task
+
+
+@task
+async def send_email(ctx: JobCtx, to: str, subject: str) -> None: ...
+
+
+@task(queue="default", timeout=120, retries=3)
+async def embed(ctx: JobCtx, doc_id: str) -> None: ...
+
+
+job_id = await enqueue(send_email, "user@example.com", "Welcome!")
+job_id = await enqueue_at(send_email, "user@example.com", "Reminder", eta=datetime(2026, 5, 9, 9, tzinfo=UTC))
 ```
 
-**Cancelling a job on a non-default queue** (pass the matching `queue_name` or the lookup silently misses):
+`@task` is pure registration — it stamps the function and returns it unchanged, so it composes with other decorators (`@task` outermost, e.g. over `@traced`).
+
+### Worker entrypoint
+
+The one real consumer shape. Tasks reach the registry only by **side-effect import** in the entrypoint, and `make_worker(...)` must be constructed **inside the already-running event loop** — building it at module level binds arq's Redis objects to a different loop than the one that runs them. Registries in `storage`, `cache`, and `vector` are per-process, so re-register them here too.
+
 ```python
-job_id = await enqueue(bulk_export, org_id, _queue_name="low-priority")
-...
-await cancel_job(job_id, queue_name="low-priority")
-await inspect_job(job_id, queue_name="low-priority")
+# knowledge/worker.py
+import asyncio
+
+from forktex_core import queue
+from forktex_core.storage import register as register_storage
+
+
+async def main() -> None:
+    from knowledge.tasks import embed  # noqa: F401  side-effect: registers @task
+
+    register_storage("default", url="http://minio:9000", bucket="kb", access_key="...", secret_key="...")
+    await queue.init("redis://redis:6379/1")
+
+    worker = queue.make_worker("redis://redis:6379/1", queue_name="default", max_jobs=8)
+    try:
+        await worker.async_run()
+    finally:
+        await queue.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-### Edge cases
+`init()` in the worker process matters independently of dispatch: a running task that calls `enqueue()` to chain work needs the pool. Pass `handle_signals=False` when a host (an API lifespan, a supervisor) already owns SIGTERM/SIGINT, or use [`forktex_core.worker`](worker.md), which wraps this whole block.
 
-| Scenario | Behaviour |
-|---|---|
-| `enqueue()` before `init()` | `QueueError("Queue not initialized…")` |
-| `@task` same name twice | Warning logged, second overwrites first |
-| `list_jobs()` on large queue | Truncated at 10,000 keys with warning |
-| `cancel_job()` — job merely queued/deferred, no worker running it yet | Returns `False` |
-| `cancel_job()` — job actively running, worker confirms cancellation | Returns `True` |
-| `cancel_job()` — job already completed, or unknown ID | Returns `False` |
-| `cancel_job()`/`inspect_job()` — `queue_name` doesn't match the job's real queue | Job looks `"not_found"` / cancel silently returns `False`, even if the job is genuinely running |
-| `inspect_job(unknown_id)` | Returns `None` |
-| `make_worker().async_run()` | Runs until `SIGTERM` — burst mode exits after all queued jobs |
+## Public surface
 
-### Error catalogue
+`__all__`:
 
-| Error | When |
-|---|---|
-| `ImportError("Install 'forktex-core[queue]'")` | `arq` not installed |
-| `QueueError("Queue not initialized")` | `enqueue`/`enqueue_at` before `init()` — subclasses `RuntimeError` |
-| `QueueError` | Other configuration or connection errors (e.g. `enqueue_job` rejected) |
+| Name | What it does |
+| --- | --- |
+| `task(_fn=None, *, queue="default", timeout=300, retries=0)` | Register an async function. Bare or parametrized. `retries` are *additional* attempts; `make_worker` maps them to arq's `max_tries = retries + 1`. |
+| `JobCtx` | `TypedDict` for the context arq injects as the first argument: `redis`, `job_id`, `job_try`, `enqueue_time`, `score`. |
+| `init(redis_url)` | Set the URL; close and drop any cached pool. |
+| `close()` | Close the pool, clear the URL. Idempotent. |
+| `enqueue(fn, *args, _queue_name=None, **kwargs) -> str` | Dispatch now; returns the arq job id. |
+| `enqueue_at(fn, *args, eta, _queue_name=None, **kwargs) -> str` | Dispatch at `eta` (must be timezone-aware). |
+| `inspect_job(job_id, *, queue_name="default") -> dict \| None` | `job_id`, `status`, `function`, `args`, `kwargs`, `enqueue_time`, `start_time`, `finish_time`, `result`, `error`, `tries`. `status` is `"queued"`, `"in_progress"`, `"complete"`, or `"not_found"`. |
+| `cancel_job(job_id, *, queue_name="default") -> bool` | Signal abort, wait up to 1s for confirmation. |
+| `list_jobs(queue_name="default", *, status=None) -> list[dict]` | Jobs still in the queue's sorted set (queued or deferred), in `inspect_job` shape. |
+| `worker_health(redis_url=None, *, queue_name="default") -> dict[str, int]` | `{"pending", "in_flight", "failed"}`. |
+| `make_worker(redis_url, *, queue_name="default", max_jobs=10, job_timeout=300, handle_signals=True) -> arq.Worker` | Build a worker over every registered `@task`, with `allow_abort_jobs=True`. |
+| `QueueError` | See below. |
 
-### Integration map
+## Errors
 
-```
-queue ──── (requires) ──── cache  [Redis — same infra, different DB index]
-queue ──── (complement) ── flow   [queue = fire-and-forget; flow = durable+replay]
-```
+| Raised | When | Catch |
+| --- | --- | --- |
+| `ImportError` | First use with `arq` not installed. | Deployment error; let it surface. |
+| `QueueError("Queue not initialized …")` | `enqueue`/`enqueue_at`/`list_jobs`/`worker_health` before `await init(...)`. | `QueueError`, or `RuntimeError`. |
+| `QueueError` | arq rejected the enqueue (deduplicated, or an unhealthy pool). | Same. |
 
-### Checklist
+`QueueError` subclasses **both** `AppError` (so it carries `code = AppErrorCode.INTERNAL` and renders through `forktex_core.api`'s envelope instead of a masked 500) and `RuntimeError` (so pre-existing `except RuntimeError` sites keep working).
 
-- [ ] `await init(redis_url)` called at startup
-- [ ] `@task` functions imported in the worker entrypoint (side-effect registration)
-- [ ] `retries=` set for tasks that can fail transiently (network, external API)
-- [ ] `timeout=` set conservatively — arq kills jobs that exceed it
-- [ ] `eta` is timezone-aware datetime for `enqueue_at`
-- [ ] `list_jobs()` used only for operator tooling, not in hot paths
+## Gotchas
+
+- **`make_worker()` at module level breaks.** Construct it inside the running loop; a module-level instance binds arq's Redis objects to the import-time loop and fails with "attached to a different loop".
+- **Registration is import-side-effect only.** If the worker entrypoint does not import the task modules, the worker starts with an empty function list and jobs sit in Redis forever. Keep the `# noqa: F401` import.
+- **Registries are per-process.** `storage`, `cache`, and `vector` clients registered in the API process do not exist in the worker; re-register them before consuming.
+- **`retry_delay` does not exist.** arq has no per-function retry-delay setting; an earlier version accepted the argument and silently ignored it. To control the gap between attempts, `raise arq.Retry(defer=seconds)` from the job body.
+- **`queue_name` must match everywhere.** `inspect_job`/`cancel_job` default to `"default"`, but arq's own `Job` defaults to `"arq:queue"`. A mismatch makes a live job report `"not_found"` and makes `cancel_job` return `False` regardless of its real state.
+- **`cancel_job` returns `True` only for a job a worker is actively running** and confirms within 1s. A merely queued or deferred job, an already-completed one, and an unknown id all return `False`.
+- **`list_jobs` cannot see running or finished jobs.** It reads the queue's sorted set, which a worker removes from on claim. It truncates at 10,000 ids with a warning — do not call it in a hot path.
+- **`worker_health`'s `failed` is cumulative and worker-published.** It comes from arq's health-check key, so it is `0` until a worker has recorded health. `pending`/`in_flight` are read straight from Redis.
+- **Duplicate task names overwrite.** The registry is keyed on `fn.__name__`; a second registration logs a warning and wins.
+- **Reuse Redis, not the database index.** Point `queue` at a different Redis DB index than `cache` so a `FLUSHDB` on one does not take the other.

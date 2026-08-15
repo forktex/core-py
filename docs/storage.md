@@ -1,242 +1,168 @@
-# `forktex_core.storage` — S3/MinIO object storage
+# forktex_core.storage
 
-> Thin async S3/MinIO connector — upload, download, delete, presigned URLs, browser form uploads. Multi-bucket services register named clients; single-bucket services use module-level functions.
+Thin async S3/MinIO connector for opaque binary objects: upload, download, delete, existence
+checks, presigned GET/PUT URLs and presigned browser POST policies. No path conventions, no
+content negotiation, no image processing — those belong in the consuming service.
 
-## Overview
-
-`storage` has no path conventions and no content negotiation — those are interface-adapter concerns in the consuming service. The module is a pure connector: it speaks S3, handles auth, and generates presigned URLs. The presigned URL **is** the access token — the actor presents it directly to MinIO, no additional auth header needed.
-
-There is no object-listing API (no `list_objects`/pagination) and no S3 chunked "Multipart Upload" support (`create_multipart_upload`/`upload_part`) — `upload()` is always a single `put_object` call. Both are out of scope for this thin connector today.
+## Install
 
 ```bash
 pip install forktex-core[storage]   # aioboto3
 ```
 
-## Quick start
+The import is deferred to `StorageClient.__init__`, which `register()` (and therefore `init()`)
+calls. So a missing extra raises **at `register()`/`init()`**, not at `import forktex_core.storage`:
 
-```python
-import forktex_core.storage as storage
-
-# Single-bucket service
-await storage.init(url="http://minio:9000", bucket="docs", access_key="key", secret_key="secret")
-
-await storage.upload("invoices/2026/01/abc.pdf", pdf_bytes, content_type="application/pdf")
-url = await storage.presign("invoices/2026/01/abc.pdf", expires_in=3600)
-data = await storage.download("invoices/2026/01/abc.pdf")
-await storage.close()
+```
+ImportError: Install 'forktex-core[storage]' (aioboto3) to use forktex_core.storage
 ```
 
-## API reference
+`botocore` (pulled in by `aioboto3`) is imported inside the methods that classify its errors.
+
+## Wiring
+
+**Shape B — named-client registry.** `register(name, ...)` builds a `StorageClient` and stores it
+in a module dict; `get_client(name)` fetches it; `deregister(name)` drops it. `init(...)` is
+`register("default", ...)`, and the module-level `upload`/`download`/`delete`/`exists`/`presign`/
+`presign_post` functions all operate on `get_client()` — i.e. the `"default"` client.
 
 ```python
-# --- Single-bucket (module-level, "default" client) ---
-async def init(url, bucket, access_key, secret_key, *,
-               region="us-east-1", public_url=None) -> None
-async def close(name="default") -> None
-async def upload(key, data, *, content_type="application/octet-stream") -> None
-async def download(key) -> bytes                    # raises ObjectNotFoundError
-async def delete(key) -> None
-async def exists(key) -> bool
-async def presign(key, expires_in=3600, *, method="get_object",
-                  content_type=None, response_content_disposition=None) -> str
-async def presign_post(key, *, expires_in=3600,
-                       content_type=None, max_size_bytes=None) -> dict
+from contextlib import asynccontextmanager
 
-# --- Multi-bucket (named clients) ---
-def register(name, url, bucket, access_key, secret_key, *,
-             region="us-east-1", public_url=None) -> StorageClient
-def get_client(name="default") -> StorageClient     # raises ClientNotRegisteredError
+from fastapi import FastAPI
 
-# --- StorageClient (per-bucket) ---
-class StorageClient:
-    async def upload(key, data, *, content_type) -> None
-    async def download(key) -> bytes
-    async def delete(key) -> None
-    async def exists(key) -> bool
-    async def presign(key, expires_in=3600, *, method, content_type,
-                      response_content_disposition) -> str
-    async def presign_post(key, *, expires_in, content_type, max_size_bytes) -> dict
-    async def ensure_bucket(*, public_read=False) -> None
-    def direct_url(key) -> str    # only for public-read buckets
+from forktex_core.storage import deregister, register
 
-# --- Config ---
-@dataclass
-class StorageConfig:
-    url: str; bucket: str; access_key: str; secret_key: str
-    region: str = "us-east-1"; public_url: str | None = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    register(
+        "media",
+        url=settings.s3_endpoint,
+        bucket=settings.s3_bucket_media,
+        access_key=settings.s3_access_key,
+        secret_key=settings.s3_secret_key,
+        public_url=settings.s3_public_endpoint,
+    )
+    yield
+    deregister("media")
+
+
+app = FastAPI(lifespan=lifespan)
 ```
 
-## Patterns
+The registry is a plain module-level dict and therefore **per-process**. A worker process must run
+its own `register()` calls at startup; it does not inherit the API process's clients. The symptom
+of forgetting is `ClientNotRegisteredError` on the first job, not at boot.
 
-### Pattern 1 — Multi-bucket service
+`register()` is idempotent by name — registering the same name again replaces the previous client.
 
-```python
-from forktex_core.storage import register, get_client
-
-# At startup
-register("media", url=s3_url, bucket="news-media", **creds, public_url=pub_url)
-register("messaging", url=s3_url, bucket="messaging", **creds, public_url=pub_url)
-register("data-lake", url=s3_url, bucket="data-lake", **creds, public_url=pub_url)
-
-# Usage — caller picks the right bucket
-await get_client("messaging").upload(key, data, content_type="application/pdf")
-url = await get_client("messaging").presign(key, expires_in=3600)
-```
-
-### Pattern 2 — Secured actor callback (presigned PUT)
+## Public surface
 
 ```python
-# Backend generates short-lived PUT URL — the S3 signature IS the access token
-# Actor PUTs directly to MinIO; no JWT or other header needed
-put_url = await client.presign(
-    f"uploads/org-{org_id}/photo.jpg",
-    expires_in=900,  # 15 minutes
-    method="put_object",
-    content_type="image/jpeg",  # MinIO enforces this during PUT
+from forktex_core.storage import (
+    ClientNotRegisteredError,
+    ObjectNotFoundError,
+    StorageClient,
+    StorageConfig,
+    StorageError,
+    close,
+    delete,
+    deregister,
+    download,
+    exists,
+    get_client,
+    init,
+    presign,
+    presign_post,
+    register,
+    upload,
 )
-
-# Return put_url to the actor; actor does:
-#   PUT {put_url}  with Content-Type: image/jpeg  and body = file bytes
 ```
 
-### Pattern 3 — Browser file upload (presigned POST)
+| Name | Description |
+|---|---|
+| `register(name, url, bucket, access_key, secret_key, *, region="us-east-1", public_url=None)` | Build and store a named client; returns it. |
+| `get_client(name="default")` | Look up a registered client. |
+| `deregister(name="default")` | Drop a name; returns the dropped client or `None`. Idempotent. |
+| `init(...)` | Async. `register("default", ...)` with the same arguments. |
+| `close(name="default")` | Async. Delegates to `deregister`; nothing is actually closed. |
+| `upload(key, data, *, content_type=...)` | Async. `put_object` on the default client. Overwrites. |
+| `download(key)` | Async. Returns `bytes`. |
+| `delete(key)` | Async. `delete_object`; a missing key is a no-op. |
+| `exists(key)` | Async. `head_object` → `bool`. |
+| `presign(key, expires_in=3600, *, method="get_object", content_type=None, response_content_disposition=None)` | Async. Presigned URL. |
+| `presign_post(key, *, expires_in=3600, content_type=None, max_size_bytes=None)` | Async. `{"url", "fields"}` for a browser form upload. |
+| `StorageClient` | Per-bucket client. Same six operations plus `ensure_bucket(*, public_read=False)` and `direct_url(key)`. |
+| `StorageConfig` | Frozen Pydantic value object: `url`, `bucket`, `access_key`, `secret_key`, `region`, `public_url`. |
+| `StorageError` | Base error, `AppErrorCode.INTERNAL`. |
+| `ObjectNotFoundError` | `AppErrorCode.NOT_FOUND`. |
+| `ClientNotRegisteredError` | `AppErrorCode.INTERNAL`. |
 
-`multipart/form-data` here is the HTTP encoding of the browser's POST body
-(an ordinary `<form>` upload) — unrelated to S3's own chunked "Multipart
-Upload" API, which this module does not implement.
+Presigned PUT for an untrusted uploader — the S3 signature *is* the token, no extra auth header:
 
 ```python
-policy = await client.presign_post(
+put_url = await get_client("media").presign(
+    f"uploads/org-{org_id}/photo.jpg",
+    expires_in=900,
+    method="put_object",
+    content_type="image/jpeg",   # enforced by the server during the PUT
+)
+```
+
+Browser form upload. The `multipart/form-data` here is the HTTP encoding of an ordinary `<form>`
+POST — unrelated to S3's chunked Multipart Upload API, which this module does not implement:
+
+```python
+policy = await get_client("media").presign_post(
     f"uploads/org-{org_id}/doc.pdf",
     expires_in=600,
     content_type="application/pdf",
-    max_size_bytes=10 * 1024 * 1024,  # 10 MB limit enforced by MinIO
+    max_size_bytes=10 * 1024 * 1024,
 )
-# policy = {"url": "http://...", "fields": {"key": ..., "Content-Type": ..., ...}}
-# Browser: POST policy["url"] as multipart/form-data with policy["fields"] + file
+# policy["url"] + policy["fields"] → browser posts them alongside the file
 ```
 
-### Pattern 4 — Public bucket direct URL
+## Errors
 
-```python
-# Only use direct_url() when bucket has public-read policy
-media_client = get_client("media")
-await media_client.ensure_bucket(public_read=True)  # sets S3 bucket policy
+All three error classes subclass `AppError`, so an HTTP transport renders them with a real status
+instead of a masked 500.
 
-direct = media_client.direct_url("images/hero.jpg")
-# → "http://cdn.example.com/news-media/images/hero.jpg"
-```
+| Raised | When | Catch? |
+|---|---|---|
+| `ImportError` | `register()`/`init()` without `aioboto3`. | No — install the extra. |
+| `ClientNotRegisteredError` | `get_client(name)` for an unregistered name. Message lists the registered names. | No — a wiring bug. |
+| `ObjectNotFoundError(key)` | `download()` on a missing key. | Yes, when a missing object is expected. |
+| `StorageError("storage download failed")` | `download()` on any other S3/network failure. | Yes, at a request boundary. |
+| `StorageError("storage existence check failed")` | `exists()` on any non-404 failure. | Yes, at a request boundary. |
+| `botocore.exceptions.ClientError`, unwrapped | `ensure_bucket()` when `head_bucket` fails with anything other than 404/`NoSuchBucket`. | Only if you call `ensure_bucket` outside startup. |
 
-## Anti-patterns
+`StorageError` messages are deliberately fixed strings: a botocore message can quote request ids,
+ARNs and headers, so the detail is logged (with the AWS error code) and reaches the caller only via
+`__cause__`.
 
-```python
-# ❌ String-matching exception messages — brittle if SDK changes
-if "NoSuchKey" in str(exc):
-    raise ObjectNotFoundError(key)
+## Gotchas
 
-# ✅ botocore.exceptions.ClientError with its structured error Code
-# (module handles this internally — download()/exists()/ensure_bucket()
-# all classify on exc.response["Error"]["Code"], never string-match)
-
-# ❌ Storing credentials in plain text in code
-StorageConfig(access_key="minioadmin", secret_key="minioadmin")  # only for dev
-
-# ✅ Load from environment
-StorageConfig(access_key=os.environ["S3_ACCESS_KEY"], ...)
-
-# ❌ Using direct_url() for private buckets — returns unsigned URL
-media_client.direct_url("private/secret.pdf")  # 403 when accessed
-
-# ✅ Use presign() for private bucket objects
-await media_client.presign("private/secret.pdf", expires_in=3600)
-```
-
----
-
-## Agent guide
-
-### Canonical forms
-
-**Startup registration (multi-bucket):**
-```python
-from forktex_core.storage import register
-
-register(
-    "media",
-    url=settings.s3_endpoint,
-    bucket=settings.s3_bucket_media,
-    access_key=settings.s3_access_key,
-    secret_key=settings.s3_secret_key,
-    public_url=settings.s3_public_endpoint,  # for presigned URLs
-)
-```
-
-**The presigned URL flow (secured callback):**
-```
-Client → POST /api/files/upload-url   (JWT auth)
-Backend → verifies auth
-Backend → await client.presign(key, method="put_object", content_type="image/jpeg", expires_in=900)
-Backend → returns {"upload_url": "...", "key": "..."}
-Client → PUT upload_url  (no auth header — signature is in the URL)
-Client → POST /api/files/confirm  {"key": "..."}  (tells backend upload is done)
-```
-
-**presign_post response shape:**
-```python
-result = await client.presign_post("uploads/doc.pdf", content_type="application/pdf")
-# result = {
-#     "url": "http://minio:9000/my-bucket",
-#     "fields": {
-#         "key": "uploads/doc.pdf",
-#         "Content-Type": "application/pdf",
-#         "AWSAccessKeyId": "...",
-#         "policy": "...",
-#         "signature": "...",
-#     }
-# }
-# Browser FormData: append each field, then append file as "file" field
-```
-
-### Edge cases
-
-| Scenario | Behaviour |
-|---|---|
-| `download(missing_key)` | `ObjectNotFoundError(key)` |
-| `exists(missing_key)` | Returns `False` |
-| `delete(missing_key)` | No-op (S3 delete is idempotent) |
-| `get_client("unregistered")` | `ClientNotRegisteredError` with list of registered names |
-| `presign(key, method="put_object", content_type="image/jpeg")` | Includes `ContentType` in signature — MinIO enforces it during PUT |
-| `public_url` not set | Presigned URLs use internal `url` — may not be browser-reachable from outside Docker |
-| `ensure_bucket()` when the bucket already exists | No-op, no policy change unless `public_read=True` |
-| `ensure_bucket()` — `head_bucket` fails with 403 (permission denied) | Raises `StorageError`, does **not** attempt `create_bucket` — only a genuine 404/`NoSuchBucket` triggers creation |
-| `direct_url(key)` — key contains spaces/`#`/`?`/etc. | URL-encoded automatically (`urllib.parse.quote`) |
-
-### Error catalogue
-
-| Error | When |
-|---|---|
-| `ImportError("Install 'forktex-core[storage]' (aioboto3) to use forktex_core.storage")` | `aioboto3` not installed |
-| `ObjectNotFoundError(key)` | `download()` or `exists()` — key doesn't exist |
-| `ClientNotRegisteredError` | `get_client(name)` — name was never `register()`ed |
-| `StorageError("storage download failed")` / `StorageError("storage existence check failed")` | Any other S3/network error. The message is **fixed**: a botocore message can quote request ids, ARNs and headers, so the detail is logged (with the AWS error code) and reaches the caller only via `__cause__`. |
-| the driver error, unwrapped | `ensure_bucket()` on a non-404 `head_bucket` failure — a 403 must not be reinterpreted as "let's create it". Logged before it propagates. |
-
-Every mutation and failure path is logged: client register/deregister, bucket
-creation, object upload (`debug`) and delete (`info`), a public-read policy
-application (`warning` — it makes the bucket world-readable), and each error path
-with the bucket, key and AWS code.
-
-### Integration map
-
-```
-storage ──── (no dep on) ─── db, cache, flow, vault, queue, vector, data, log
-```
-
-### Checklist
-
-- [ ] `public_url` set when internal Docker URL differs from browser-reachable URL
-- [ ] `register()` called at startup before any route handles requests
-- [ ] `method="put_object"` + `content_type=` used for actor upload callbacks
-- [ ] `presign_post()` used for browser form uploads (not `presign(method="put_object")`)
-- [ ] `direct_url()` used only for public-read buckets
-- [ ] `ensure_bucket(public_read=True)` called before `direct_url()` in staging/dev
+- **`close()` closes nothing.** It just deregisters. Boto clients are created per call and closed
+  by their own context manager, so there is no long-lived connection to release. The `async` shape
+  exists for callers that already `await` it.
+- **`exists()` returns `False` for a missing key** — it does not raise `ObjectNotFoundError`. Only
+  `download()` does.
+- **`upload()` overwrites silently.** There is no conditional-put or if-none-match option.
+- **No listing API.** There is no `list_objects` and no pagination; keep your own index.
+- **`public_url` matters for presigning.** Presigned URLs and `direct_url()` are generated against
+  `public_url or url`; ordinary uploads/downloads always use `url`. If the internal Docker endpoint
+  differs from the browser-reachable one and you leave `public_url` unset, the URLs you hand out
+  will not resolve from outside the network.
+- **`content_type` only enters the signature for `method="put_object"`**, and
+  `response_content_disposition` only for `method="get_object"`; the other combination is dropped
+  without warning.
+- **`direct_url()` performs no auth check.** It is only correct against a bucket with a public-read
+  policy. The key is URL-encoded with `urllib.parse.quote`.
+- **`ensure_bucket(public_read=True)` makes the bucket world-readable** and logs at `warning` level
+  when it applies the policy.
+- **`ensure_bucket()` only creates on a genuine 404/`NoSuchBucket`.** A 403 from `head_bucket`
+  propagates rather than being reinterpreted as "create it".
+- **Credentials are `repr`-suppressed.** `StorageConfig.access_key`/`secret_key` use
+  `Field(repr=False)` so they do not leak into logs or tracebacks — but `StorageConfig` is a frozen
+  Pydantic value object, not a dataclass, so do not construct it positionally.

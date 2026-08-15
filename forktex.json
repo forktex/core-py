@@ -277,6 +277,15 @@
         "commands": [
           "poetry run python3 -m ruff check --fix src/ tests/"
         ]
+      },
+      "examples": {
+        "targets": [
+          "examples"
+        ],
+        "description": "Run every examples/*.py against real testcontainers (Postgres + Redis + MinIO + Qdrant). Opt-in; not gated by `make ci` because it boots four containers.",
+        "commands": [
+          "poetry run python3 -m scripts.run_examples"
+        ]
       }
     }
   },

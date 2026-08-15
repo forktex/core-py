@@ -183,6 +183,9 @@ test-cov: ## Run the suite with coverage reporting
 lint-fix: ## Lint and auto-fix where possible
 	poetry run python3 -m ruff check --fix src/ tests/
 
+examples: ## Run every examples/*.py against real testcontainers (Postgres + Redis + MinIO + Qdrant). Opt-in; not gated by `make ci` because it boots four containers.
+	poetry run python3 -m scripts.run_examples
+
 deps-lock: ## Lock dependencies
 	poetry lock
 
@@ -197,4 +200,4 @@ quality: format lint typing ## chord (format + lint + typing)
 install-global: ## Install the latest local forktex CLI globally in editable mode
 	pip install --break-system-packages -e .
 
-.PHONY: format lint typing test security license sync docs manual install build publish clean apply destroy monitor acceptance typecheck audit publish-test license-check license-fix license-strip codegen codegen-check ci format-check test-perf test-perf-headroom test-perf-report catalog-check smoke test-cov lint-fix deps-lock local local-down local-monitor quality install-global
+.PHONY: format lint typing test security license sync docs manual install build publish clean apply destroy monitor acceptance typecheck audit publish-test license-check license-fix license-strip codegen codegen-check ci format-check test-perf test-perf-headroom test-perf-report catalog-check smoke test-cov lint-fix examples deps-lock local local-down local-monitor quality install-global

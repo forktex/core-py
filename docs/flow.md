@@ -1,254 +1,133 @@
-# `forktex_core.flow` — Durable execution
+# `forktex_core.flow`
 
-> Postgres-native durable workflow engine — graph-first pipelines, state machines, and AI agent loops. Guaranteed delivery, replay-safe, zero external process.
-
-## Overview
-
-`flow` runs inside your existing Postgres — no Temporal, no RabbitMQ, no separate scheduler. Each workflow run is a row. The driver is an asyncio loop that competes for a Postgres advisory lock; one process is leader. Replay makes every step idempotent.
-
-Everything below the API is `forktex_core.database`: the connection handle, the
-page shape, the keyset predicate, the DDL constructs, reflection and the
-identifier policy. `flow` emits **no raw SQL** — the schema-templated
-`forktex_flow` name that the old f-strings existed to re-interpolate is handled by
-the engine's `schema_translate_map`, which SQLAlchemy Core honours on its own.
-
-Always bundled. See `flow/__init__.py` docstring for the full 100-line reference.
+Durable workflow engine on Postgres: pipelines and graphs of steps that survive process restarts,
+with retries, scheduling, signals and replay. State lives in the `forktex_flow` schema, which the
+package owns and migrates itself.
 
 ```bash
-pip install forktex-core   # flow always included
+pip install "forktex-core[flow]"
 ```
 
-## Quick start
+## Wiring
+
+Shape C — you construct and own a `Flow`; there is no module-level default. The lifecycle is
+**construct → register workflows → `start_driver()` → … → `stop_driver()` → `close()`**.
 
 ```python
-from forktex_core.flow import Flow, Ctx, step, edge, wait_edge, START, END
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from forktex_core.flow import Flow
 
 flow = Flow(database_url="postgresql+asyncpg://user:pass@localhost/db")
-await flow.init()
-
-# Or share a pool a consumer already has (e.g. because it also uses grid), so
-# the process opens one engine instead of two. Exactly one of the two arguments:
-#   db = Database(url, schema_translate_map={"forktex_flow": schema})
-#   flow = Flow(database=db, schema=schema)   # borrowed: close() won't dispose it
 
 
-# Scheduled workflow
-@flow.scheduled("reports.daily", version=1, cron="0 6 * * *")
-async def daily_report(ctx: Ctx, state: dict) -> dict:
-    data = await fetch_data()
-    return {"report_url": await upload(data)}
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    register_workflows(flow)   # see below — must happen before start_driver()
+    await flow.start_driver()
+    yield
+    await flow.stop_driver()
+    await flow.close()
 
 
-# Pipeline
-@step
-async def send_welcome(ctx: Ctx, state: dict) -> dict:
-    await smtp.send(state["email"], "Welcome!")
-    return {}
-
-
-@flow.pipeline("onboarding.user", version=1)
-class UserOnboarding:
-    steps = [send_welcome, create_workspace]
-
-
-# Graph (state machine)
-@flow.graph("invoice.approval", version=1)
-class InvoiceApproval:
-    entry = "pending"
-    terminal = "approved"
-    topology = [
-        wait_edge("pending", "approved", on="invoice.approved"),
-        wait_edge("pending", "rejected", on="invoice.rejected"),
-    ]
-
-
-# Dispatch
-instance = await flow.run("onboarding.user", state={"email": "x@example.com"})
-await instance.wait(timeout=60.0)
-
-# Query
-page = await flow.query().workflow("onboarding.user").status("completed").limit(25).fetch()
+app = FastAPI(lifespan=lifespan)
 ```
 
-## API reference
+> **Without `start_driver()` nothing executes.** `flow.run()` inserts a row into `flow_run` and
+> returns; the driver is what picks it up. A service that only calls `init()` gets an engine that
+> durably records work nobody performs.
 
-The complete API is documented in `src/forktex_core/flow/__init__.py`. Key surface:
+`start_driver()` calls `init()` for you, so an explicit `init()` is only needed if you want the
+schema migrated before the driver starts. Both are idempotent and serialise concurrent callers
+through a Postgres advisory lock, so running several instances is safe — only one acquires the lock
+and drives.
+
+Registration must precede `start_driver()`, because it loads namespace definitions immediately
+afterwards.
+
+### Registering workflows
+
+Two shapes, both in production use. Imperative, when the state classes live alongside:
 
 ```python
-class Flow:
-    def __init__(self, database_url: str, schema: str = "forktex_flow",
-                 poll_interval: float = 1.0, leader_lock_key: int = ...)
-    async def init() -> None               # applies migrations, starts driver
-    async def run(name, *, version=None, state={}, namespace=None, ...) -> WorkflowInstance
-    async def get(run_id: UUID) -> RunInfo
-    async def wait(run_id, timeout=None) -> RunInfo
-    async def send(run_id, event, payload=None) -> None
-    def query() -> InstanceQuery
+from forktex_core.flow import Flow
 
-# Decorators
-@flow.scheduled(name, version, cron, state=dict)
-@flow.pipeline(name, version, state=dict)
-@flow.graph(name, version)
-@flow.step_template(name)   # reusable step for namespace-track
-@step                       # plain step function
-@node                       # graph node
-@parallel(steps)            # concurrent steps
-
-# Graph DSL
-edge(src, dst)
-conditional(src, [(condition_fn, dst), ..., default_dst])
-wait_edge(src, dst, on="event.name")
-START, END
-
-# Query API
-flow.query()
-  .workflow(name, version=None)
-  .namespace(ns)
-  .status(*statuses)
-  .since(dt), .until(dt)
-  .metadata(**kv), .state(**kv)
-  .sort(field, desc=True)
-  .limit(n)
-  .fetch(cursor=None) -> InstancePage   # = database.pagination.Page[WorkflowInstance]
-                                        # .items / .has_more / .next_cursor / .total
-  .count() -> int
-  .summary() -> InstanceSummary
-
-# Extensions (custom columns on run/step_run)
-class MyExt(FlowExtension):
-    def extra_run_columns(self) -> list[ColumnDef]: ...
-flow = Flow(..., extensions=[MyExt()])
+flow = Flow(database_url=url, extensions=[MyExtension()])
+flow.pipeline("deploy.apply", version=4, state=DeployState)(DeployPipeline)
+flow.scheduled("lifecycle.reconcile", version=1, cron="*/30 * * * *", state=ReconcileState)(reconcile)
 ```
 
-### Persistence primitives
-
-Flow persists durable execution state in Postgres through these ORM rows:
-
-| Model | Purpose |
-|:------|:--------|
-| `Run` | One workflow instance, including status, state, metadata, and attempts. |
-| `StepRun` | One step attempt/replay unit with heartbeat and retry state. |
-| `RunEvent` | Append-only event stream used by `Flow.stream()` and audit readers. |
-| `ScheduledRun` | Cron-backed recurring workflow cursor. |
-
-The tables map onto `database.models.substrate_base("forktex_flow")` — their own
-`MetaData`, deliberately not `BaseDBModel`'s. That registry belongs to the
-consumer: `BaseDBModel.metadata.create_all()` is the documented way to build your
-own tables, and it must not also try to create `forktex_flow.*` in a schema you
-never asked for. `flow` owns its migration runner instead.
-
-The driver loop uses `claim_pending_runs(flow, limit)` to atomically claim runnable work and `reclaim_stale_steps(flow)` to return timed-out step attempts to the pending pool. These are internal primitives, but they are the canonical reference for sibling services that need claim/reclaim semantics — the claim is
-`with_for_update(skip_locked=True)` on a `scalar_subquery()` fed into
-`update().returning()`, in Core.
-
-`sort()` works with the cursor: the keyset predicate is built from the resolved
-sort column, so paging by `finished_at` / `status` / `workflow` is correct. It
-previously hardcoded the predicate to `started_at` while `ORDER BY` used whatever
-was asked for, which skipped and repeated rows on every other sort field.
-
-## Patterns
-
-### Pattern 1 — Namespace track (tenant-defined workflows)
+Or decorator-based, where the modules are imported for their side effects between construction and
+`start_driver()`:
 
 ```python
-await flow.define(
-    name="failure.response",
-    namespace=f"org-{org_id}",
-    version=1,
-    config={"type": "pipeline", "steps": ["my_service.handle_failure"]},
-)
-instance = await flow.run("failure.response", namespace=f"org-{org_id}", state={})
+import importlib
+
+for module in ("billing.pipelines", "crm.pipelines"):
+    importlib.import_module(module)   # module-level @flow.pipeline decorators run here
+await flow.start_driver()
 ```
 
-### Pattern 2 — Child workflows (scatter/gather)
+Module-level decorators need the live `Flow` instance to exist first, which is why the import is
+deferred rather than written at the top of the file.
 
-```python
-@step
-async def process_all(ctx: Ctx, state: dict) -> dict:
-    results = await ctx.map(
-        "item.processor",
-        inputs=[{"item_id": id} for id in state["item_ids"]],
-    )
-    return {"results": results}
-```
+## Public surface
 
-### Pattern 3 — State reducers (parallel merge)
+### The engine
 
-```python
-from typing import Annotated
-import operator
+| Name | Purpose |
+|:---|:---|
+| `Flow` | The instance you construct and own |
+| `Flow.pipeline(name, *, version, state)` | Register a linear pipeline |
+| `Flow.graph(...)` | Register a graph workflow |
+| `Flow.scheduled(name, *, version, cron, state)` | Register a cron-driven workflow |
+| `Flow.step_template(name)` | Register a reusable step |
+| `Flow.run(...)` | Enqueue a run; returns once persisted |
+| `Flow.send(run_id, *, event, payload)` | Deliver a signal to a waiting run |
+| `Flow.query()` / `Flow.instances()` | Read runs back |
+| `Flow.init()` / `start_driver()` / `stop_driver()` / `close()` | Lifecycle |
 
+### Authoring
 
-class ProcessState(TypedDict):
-    results: Annotated[list[dict], operator.add]  # list merge on parallel steps
-```
+`step`, `node`, `edge`, `conditional`, `parallel`, `wait_edge`, `START`, `END`, `Ctx`,
+`NodeDef`, `StepSpec`, `StepTemplateDef`, `ColumnDef`, `ParallelGroup`,
+`DirectEdge`, `ConditionalEdge`, `WaitEdge`, `WorkflowDefinition`.
 
-## Anti-patterns
+### Reading
 
-```python
-# ❌ Flow depends on external state (steps must be idempotent)
-@step
-async def send_email(ctx, state):
-    if not state.get("email_sent"):  # wrong — replay breaks this
-        await smtp.send(...)
+`WorkflowInstance`, `InstanceQuery`, `InstancePage`, `InstanceSummary`, `NodeInstance`,
+`RunInfo`, `RunUpdate`, `StepRunInfo`.
 
+### Extending and auditing
 
-# ✅ External idempotency key
-@step
-async def send_email(ctx, state):
-    await smtp.send(..., idempotency_key=str(ctx.run_id))
-    return {"email_sent": True}
+`FlowExtension` (declare extra columns and terminal hooks), `apply_migrations`,
+`audit_workflows`, `AuditReport`.
 
+`audit_workflows` hashes each workflow's AST so a definition change that would break in-flight runs
+is caught in your own CI. It is a library function — wire it into a test.
 
-# ❌ Raising inside a step for business logic
-@step
-async def validate(ctx, state):
-    if not state.get("name"):
-        raise ValueError("name required")  # marks step FAILED permanently
+## Errors
 
+| Error | Raised when |
+|:---|:---|
+| `FlowError` | Base class — catch this to cover the package |
+| `StepFailed` | A step raised and exhausted its retries |
+| `WorkflowFailed` | The run terminated in a failed state |
+| `WorkflowCancelled` | The run was cancelled |
+| `GraphStuckError` | No edge is traversable and the graph cannot reach `END` |
+| `SignalTimeout` | A `wait_edge` expired before its signal arrived |
 
-# ✅ Return validation outcome in state, branch in graph
-@step
-async def validate(ctx, state):
-    return {"valid": bool(state.get("name"))}
-```
+## Gotchas
 
----
-
-## Agent guide
-
-### Canonical forms
-
-**Three declaration tracks (choose one per workflow):**
-
-| Track | When |
-|---|---|
-| `@flow.scheduled(cron=...)` | Timed recurring jobs |
-| `@flow.pipeline(steps=[...])` | Linear sequence, optional conditions |
-| `@flow.graph(topology=[...])` | Branching, cycles, event-driven |
-
-**Dispatch is identical for all tracks:**
-```python
-instance = await flow.run("my.workflow", state={"key": "value"})
-instance = await instance.wait(timeout=120)
-print(instance.status, instance.state)
-```
-
-### Edge cases
-
-| Scenario | Behaviour |
-|---|---|
-| Step raises exception | Retried with backoff; after max retries → `StepFailed`, run `FAILED` |
-| Driver process dies while holding lock | Postgres auto-releases on connection drop; next worker becomes leader |
-| `flow.run()` — workflow not registered | `KeyError` at runtime |
-| `wait_edge` — signal never arrives | Run stays in `running` until `ctx.send(event)` or timeout cancels |
-| `flow.init()` called from multiple workers | Advisory lock serialises — only first applies migrations |
-
-### Integration map
-
-```
-flow ──── (uses) ──── db.locks.try_advisory_lock    [leader election]
-flow ──── (uses) ──── db.migrate.SchemaMigrationRunner  [forktex_flow.* schema]
-flow ──── (uses) ──── forktex_flow.* schema         [separate from consumer alembic]
-flow ──── (complement) ── queue                     [queue=fire-and-forget; flow=durable]
-```
+- The driver polls; a run is not executed synchronously by `run()`. Tests must either start the
+  driver or drive the run explicitly.
+- `close()` disposes the connection pool **only** when the `Flow` created it. A pool passed in via
+  `database=` belongs to you.
+- `stop_driver()` is idempotent and never raises on a driver that already died — it logs instead, so
+  shutdown is not blocked.
+- The `forktex_flow` schema is owned by this package and mapped onto its own metadata, so your own
+  `BaseDBModel.metadata.create_all()` will not create or drop it. Use `apply_migrations`.
+- Running the driver in several processes is safe, but only the lock holder makes progress; it is
+  not a way to scale throughput.
